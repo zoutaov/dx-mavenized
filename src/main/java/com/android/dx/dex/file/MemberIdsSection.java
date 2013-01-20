@@ -16,6 +16,7 @@
 
 package com.android.dx.dex.file;
 
+import com.android.dx.command.DxConsole;
 import com.android.dx.util.DexException;
 import java.util.Formatter;
 import java.util.Map;
@@ -26,6 +27,13 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Member (field or method) refs list section of a {@code .dex} file.
  */
 public abstract class MemberIdsSection extends UniformItemSection {
+    public static boolean printMembers = false;
+    static {
+        String envPrintMember = System.getenv("DX_PRINT_MEMBER");
+        if(envPrintMember!=null) {
+            printMembers = Boolean.parseBoolean(envPrintMember);
+        }
+    }
     /** The largest addressable member is 0xffff, in the dex spec as field@CCCC or meth@CCCC. */
     private static final int MAX_MEMBERS = 0x10000;
 
@@ -50,7 +58,11 @@ public abstract class MemberIdsSection extends UniformItemSection {
         }
 
         for (Object i : items()) {
-            ((MemberIdItem) i).setIndex(idx);
+            MemberIdItem mii = (MemberIdItem) i;
+            if(printMembers) {
+                DxConsole.out.println(mii.getRef());
+            }
+            mii.setIndex(idx);
             idx++;
         }
     }
