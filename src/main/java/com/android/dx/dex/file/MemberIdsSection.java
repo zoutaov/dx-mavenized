@@ -17,7 +17,10 @@
 package com.android.dx.dex.file;
 
 import com.android.dx.command.DxConsole;
+import com.android.dx.command.Main;
 import com.android.dx.util.DexException;
+
+import java.io.*;
 import java.util.Formatter;
 import java.util.Map;
 import java.util.TreeMap;
@@ -27,13 +30,6 @@ import java.util.concurrent.atomic.AtomicInteger;
  * Member (field or method) refs list section of a {@code .dex} file.
  */
 public abstract class MemberIdsSection extends UniformItemSection {
-    public static boolean printMembers = false;
-    static {
-        String envPrintMember = System.getenv("DX_PRINT_MEMBER");
-        if(envPrintMember!=null) {
-            printMembers = Boolean.parseBoolean(envPrintMember);
-        }
-    }
     /** The largest addressable member is 0xffff, in the dex spec as field@CCCC or meth@CCCC. */
     private static final int MAX_MEMBERS = 0x10000;
 
@@ -53,17 +49,40 @@ public abstract class MemberIdsSection extends UniformItemSection {
     protected void orderItems() {
         int idx = 0;
 
-        if (items().size() > MAX_MEMBERS) {
-            throw new DexException(tooManyMembersMessage());
-        }
+        PrintWriter w = createDumpWriter();
 
         for (Object i : items()) {
             MemberIdItem mii = (MemberIdItem) i;
-            if(printMembers) {
-                DxConsole.out.println(mii.getRef());
-            }
             mii.setIndex(idx);
+            if(w!=null) {
+                w.println(mii.getRef());
+            }
             idx++;
+        }
+
+        if(w!=null) {
+            w.close();
+        }
+
+        if (items().size() > MAX_MEMBERS) {
+            throw new DexException(tooManyMembersMessage());
+        }
+    }
+
+    private PrintWriter createDumpWriter() {
+        String outName = null;
+        if(getName()=="method_ids") {
+            outName = Main.fileDumpMethods;
+        } else {
+            outName = Main.fileDumpFields;
+        }
+        if(outName==null) return null;
+        try {
+            File outFile = new File(outName);
+            DxConsole.out.println("Writing "+outFile.getAbsolutePath());
+            return new PrintWriter( new OutputStreamWriter(new FileOutputStream(outFile)) );
+        } catch (FileNotFoundException e) {
+            throw new RuntimeException(e);
         }
     }
 
