@@ -17,6 +17,10 @@
 package com.android.dx.dex.file;
 
 import com.android.dex.DexException;
+import com.android.dx.command.DxConsole;
+import net.hanjava.dx.Toy;
+
+import java.io.PrintWriter;
 import java.util.Formatter;
 import java.util.Map;
 import java.util.TreeMap;
@@ -45,13 +49,24 @@ public abstract class MemberIdsSection extends UniformItemSection {
     protected void orderItems() {
         int idx = 0;
 
-        if (items().size() > MAX_MEMBERS) {
-            throw new DexException(tooManyMembersMessage());
-        }
+        PrintWriter w = Toy.createDumpWriter(getName());
 
         for (Object i : items()) {
-            ((MemberIdItem) i).setIndex(idx);
+            MemberIdItem mii = (MemberIdItem) i;
+            mii.setIndex(idx);
+            if(w!=null) {
+                w.println(mii.getRef());
+            }
             idx++;
+        }
+
+        if(w!=null) {
+            w.close();
+        }
+
+        // delaying this check to get member log - Alan Goo
+        if (items().size() > MAX_MEMBERS) {
+            throw new DexException(tooManyMembersMessage());
         }
     }
 
