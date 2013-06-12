@@ -16,11 +16,7 @@
 
 package com.android.dx.dex.file;
 
-import com.android.dx.command.DxConsole;
-import com.android.dx.command.Main;
-import com.android.dx.util.DexException;
-
-import java.io.*;
+import com.android.dex.DexException;
 import java.util.Formatter;
 import java.util.Map;
 import java.util.TreeMap;
@@ -49,40 +45,13 @@ public abstract class MemberIdsSection extends UniformItemSection {
     protected void orderItems() {
         int idx = 0;
 
-        PrintWriter w = createDumpWriter();
-
-        for (Object i : items()) {
-            MemberIdItem mii = (MemberIdItem) i;
-            mii.setIndex(idx);
-            if(w!=null) {
-                w.println(mii.getRef());
-            }
-            idx++;
-        }
-
-        if(w!=null) {
-            w.close();
-        }
-
         if (items().size() > MAX_MEMBERS) {
             throw new DexException(tooManyMembersMessage());
         }
-    }
 
-    private PrintWriter createDumpWriter() {
-        String outName = null;
-        if(getName()=="method_ids") {
-            outName = Main.fileDumpMethods;
-        } else {
-            outName = Main.fileDumpFields;
-        }
-        if(outName==null) return null;
-        try {
-            File outFile = new File(outName);
-            DxConsole.out.println("Writing "+outFile.getAbsolutePath());
-            return new PrintWriter( new OutputStreamWriter(new FileOutputStream(outFile)) );
-        } catch (FileNotFoundException e) {
-            throw new RuntimeException(e);
+        for (Object i : items()) {
+            ((MemberIdItem) i).setIndex(idx);
+            idx++;
         }
     }
 

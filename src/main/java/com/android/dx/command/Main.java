@@ -23,22 +23,6 @@ import com.android.dx.Version;
  * to the right "actual" main.
  */
 public class Main {
-    /** dump file name for methods. */
-    public static String fileDumpMethods = null;
-    /** dump file name for fields. */
-    public static String fileDumpFields = null;
-
-    static {
-        String envDumpMethods = System.getenv("DX_FILE_DUMP_METHODS");
-        if(envDumpMethods!=null && envDumpMethods.length()>0) {
-            Main.fileDumpMethods = envDumpMethods;
-        }
-        String envDumpFields = System.getenv("DX_FILE_DUMP_FIELDS");
-        if(envDumpFields!=null && envDumpFields.length()>0) {
-            Main.fileDumpFields = envDumpFields;
-        }
-    }
-
     private static String USAGE_MESSAGE =
         "usage:\n" +
         "  dx --dex [--debug] [--verbose] [--positions=<style>] " +

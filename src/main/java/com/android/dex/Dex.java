@@ -14,20 +14,14 @@
  * limitations under the License.
  */
 
-package com.android.dx.io;
+package com.android.dex;
 
-import com.android.dx.dex.DexFormat;
-import com.android.dx.dex.SizeOf;
-import com.android.dx.dex.TableOfContents;
-import com.android.dx.io.Code.CatchHandler;
-import com.android.dx.io.Code.Try;
-import com.android.dx.merge.TypeList;
-import com.android.dx.util.ByteInput;
-import com.android.dx.util.ByteOutput;
-import com.android.dx.util.DexException;
-import com.android.dx.util.FileUtils;
-import com.android.dx.util.Leb128Utils;
-import com.android.dx.util.Mutf8;
+import com.android.dex.Code.CatchHandler;
+import com.android.dex.Code.Try;
+import com.android.dex.util.ByteInput;
+import com.android.dex.util.ByteOutput;
+import com.android.dex.util.FileUtils;
+
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -36,12 +30,17 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UTFDataFormatException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.AbstractList;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.RandomAccess;
+import java.util.zip.Adler32;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
@@ -49,12 +48,21 @@ import java.util.zip.ZipFile;
  * The bytes of a dex file in memory for reading and writing. All int offsets
  * are unsigned.
  */
-public final class DexBuffer {
-    private byte[] data;
-    private final TableOfContents tableOfContents = new TableOfContents();
-    private int length = 0;
+public final class Dex {
+    private static final int CHECKSUM_OFFSET = 8;
+    private static final int CHECKSUM_SIZE = 4;
+    private static final int SIGNATURE_OFFSET = CHECKSUM_OFFSET + CHECKSUM_SIZE;
+    private static final int SIGNATURE_SIZE = 20;
 
-    private final List<String> strings = new AbstractList<String>() {
+    private ByteBuffer data;
+    private final TableOfContents tableOfContents = new TableOfContents();
+    private int nextSectionStart = 0;
+
+    private static abstract class AbstractRandomAccessList<T>
+            extends AbstractList<T> implements RandomAccess {
+    }
+
+    private List<String> strings = new AbstractRandomAccessList<String>() {
         @Override public String get(int index) {
             checkBounds(index, tableOfContents.stringIds.size);
             return open(tableOfContents.stringIds.off + (index * SizeOf.STRING_ID_ITEM))
@@ -65,7 +73,7 @@ public final class DexBuffer {
         }
     };
 
-    private final List<Integer> typeIds = new AbstractList<Integer>() {
+    private final List<Integer> typeIds = new AbstractRandomAccessList<Integer>() {
         @Override public Integer get(int index) {
             checkBounds(index, tableOfContents.typeIds.size);
             return open(tableOfContents.typeIds.off + (index * SizeOf.TYPE_ID_ITEM)).readInt();
@@ -75,7 +83,7 @@ public final class DexBuffer {
         }
     };
 
-    private final List<String> typeNames = new AbstractList<String>() {
+    private final List<String> typeNames = new AbstractRandomAccessList<String>() {
         @Override public String get(int index) {
             checkBounds(index, tableOfContents.typeIds.size);
             return strings.get(typeIds.get(index));
@@ -85,7 +93,7 @@ public final class DexBuffer {
         }
     };
 
-    private final List<ProtoId> protoIds = new AbstractList<ProtoId>() {
+    private final List<ProtoId> protoIds = new AbstractRandomAccessList<ProtoId>() {
         @Override public ProtoId get(int index) {
             checkBounds(index, tableOfContents.protoIds.size);
             return open(tableOfContents.protoIds.off + (SizeOf.PROTO_ID_ITEM * index))
@@ -96,7 +104,7 @@ public final class DexBuffer {
         }
     };
 
-    private final List<FieldId> fieldIds = new AbstractList<FieldId>() {
+    private final List<FieldId> fieldIds = new AbstractRandomAccessList<FieldId>() {
         @Override public FieldId get(int index) {
             checkBounds(index, tableOfContents.fieldIds.size);
             return open(tableOfContents.fieldIds.off + (SizeOf.MEMBER_ID_ITEM * index))
@@ -107,7 +115,7 @@ public final class DexBuffer {
         }
     };
 
-    private final List<MethodId> methodIds = new AbstractList<MethodId>() {
+    private final List<MethodId> methodIds = new AbstractRandomAccessList<MethodId>() {
         @Override public MethodId get(int index) {
             checkBounds(index, tableOfContents.methodIds.size);
             return open(tableOfContents.methodIds.off + (SizeOf.MEMBER_ID_ITEM * index))
@@ -119,33 +127,38 @@ public final class DexBuffer {
     };
 
     /**
-     * Creates a new dex buffer defining no classes.
+     * Creates a new dex that reads from {@code data}. It is an error to modify
+     * {@code data} after using it to create a dex buffer.
      */
-    public DexBuffer() {
-        this.data = new byte[0];
+    public Dex(byte[] data) throws IOException {
+        this(ByteBuffer.wrap(data));
+    }
+
+    private Dex(ByteBuffer data) throws IOException {
+        this.data = data;
+        this.data.order(ByteOrder.LITTLE_ENDIAN);
+        this.tableOfContents.readFrom(this);
     }
 
     /**
-     * Creates a new dex buffer that reads from {@code data}. It is an error to
-     * modify {@code data} after using it to create a dex buffer.
+     * Creates a new empty dex of the specified size.
      */
-    public DexBuffer(byte[] data) throws IOException {
-        this.data = data;
-        this.length = data.length;
-        this.tableOfContents.readFrom(this);
+    public Dex(int byteCount) throws IOException {
+        this.data = ByteBuffer.wrap(new byte[byteCount]);
+        this.data.order(ByteOrder.LITTLE_ENDIAN);
     }
 
     /**
      * Creates a new dex buffer of the dex in {@code in}, and closes {@code in}.
      */
-    public DexBuffer(InputStream in) throws IOException {
+    public Dex(InputStream in) throws IOException {
         loadFrom(in);
     }
 
     /**
      * Creates a new dex buffer from the dex file {@code file}.
      */
-    public DexBuffer(File file) throws IOException {
+    public Dex(File file) throws IOException {
         if (FileUtils.hasArchiveSuffix(file.getName())) {
             ZipFile zipFile = new ZipFile(file);
             ZipEntry entry = zipFile.getEntry(DexFormat.DEX_IN_JAR_NAME);
@@ -162,6 +175,31 @@ public final class DexBuffer {
         }
     }
 
+    /**
+     * Creates a new dex from the contents of {@code bytes}. This API supports
+     * both {@code .dex} and {@code .odex} input. Calling this constructor
+     * transfers ownership of {@code bytes} to the returned Dex: it is an error
+     * to access the buffer after calling this method.
+     */
+    public static Dex create(ByteBuffer data) throws IOException {
+        data.order(ByteOrder.LITTLE_ENDIAN);
+
+        // if it's an .odex file, set position and limit to the .dex section
+        if (data.get(0) == 'd'
+                && data.get(1) == 'e'
+                && data.get(2) == 'y'
+                && data.get(3) == '\n') {
+            data.position(8);
+            int offset = data.getInt();
+            int length = data.getInt();
+            data.position(offset);
+            data.limit(offset + length);
+            data = data.slice();
+        }
+
+        return new Dex(data);
+    }
+
     private void loadFrom(InputStream in) throws IOException {
         ByteArrayOutputStream bytesOut = new ByteArrayOutputStream();
         byte[] buffer = new byte[8192];
@@ -172,8 +210,8 @@ public final class DexBuffer {
         }
         in.close();
 
-        this.data = bytesOut.toByteArray();
-        this.length = data.length;
+        this.data = ByteBuffer.wrap(bytesOut.toByteArray());
+        this.data.order(ByteOrder.LITTLE_ENDIAN);
         this.tableOfContents.readFrom(this);
     }
 
@@ -184,7 +222,14 @@ public final class DexBuffer {
     }
 
     public void writeTo(OutputStream out) throws IOException {
-        out.write(data);
+        byte[] buffer = new byte[8192];
+        ByteBuffer data = this.data.duplicate(); // positioned ByteBuffers aren't thread safe
+        data.clear();
+        while (data.hasRemaining()) {
+            int count = Math.min(buffer.length, data.remaining());
+            data.get(buffer, 0, count);
+            out.write(buffer, 0, count);
+        }
     }
 
     public void writeTo(File dexOut) throws IOException {
@@ -198,33 +243,48 @@ public final class DexBuffer {
     }
 
     public Section open(int position) {
-        if (position < 0 || position > length) {
-            throw new IllegalArgumentException("position=" + position + " length=" + length);
+        if (position < 0 || position >= data.capacity()) {
+            throw new IllegalArgumentException("position=" + position
+                    + " length=" + data.capacity());
         }
-        return new Section(position);
+        ByteBuffer sectionData = data.duplicate();
+        sectionData.order(ByteOrder.LITTLE_ENDIAN); // necessary?
+        sectionData.position(position);
+        sectionData.limit(data.capacity());
+        return new Section("section", sectionData);
     }
 
     public Section appendSection(int maxByteCount, String name) {
-        int limit = fourByteAlign(length + maxByteCount);
-        Section result = new Section(name, length, limit);
-        length = limit;
+        if ((maxByteCount & 3) != 0) {
+            throw new IllegalStateException("Not four byte aligned!");
+        }
+        int limit = nextSectionStart + maxByteCount;
+        ByteBuffer sectionData = data.duplicate();
+        sectionData.order(ByteOrder.LITTLE_ENDIAN); // necessary?
+        sectionData.position(nextSectionStart);
+        sectionData.limit(limit);
+        Section result = new Section(name, sectionData);
+        nextSectionStart = limit;
         return result;
     }
 
-    public void noMoreSections() {
-        data = new byte[length];
-    }
-
     public int getLength() {
-        return length;
+        return data.capacity();
     }
 
-    public static int fourByteAlign(int position) {
-        return (position + 3) & ~3;
+    public int getNextSectionStart() {
+        return nextSectionStart;
     }
 
+    /**
+     * Returns a copy of the the bytes of this dex.
+     */
     public byte[] getBytes() {
-        return data;
+        ByteBuffer data = this.data.duplicate(); // positioned ByteBuffers aren't thread safe
+        byte[] result = new byte[data.capacity()];
+        data.position(0);
+        data.get(result);
+        return result;
     }
 
     public List<String> strings() {
@@ -258,7 +318,7 @@ public final class DexBuffer {
                     return Collections.<ClassDef>emptySet().iterator();
                 }
                 return new Iterator<ClassDef>() {
-                    private DexBuffer.Section in = open(tableOfContents.classDefs.off);
+                    private Dex.Section in = open(tableOfContents.classDefs.off);
                     private int count = 0;
 
                     public boolean hasNext() {
@@ -302,40 +362,77 @@ public final class DexBuffer {
         return open(offset).readCode();
     }
 
+    /**
+     * Returns the signature of all but the first 32 bytes of this dex. The
+     * first 32 bytes of dex files are not specified to be included in the
+     * signature.
+     */
+    public byte[] computeSignature() throws IOException {
+        MessageDigest digest;
+        try {
+            digest = MessageDigest.getInstance("SHA-1");
+        } catch (NoSuchAlgorithmException e) {
+            throw new AssertionError();
+        }
+        byte[] buffer = new byte[8192];
+        ByteBuffer data = this.data.duplicate(); // positioned ByteBuffers aren't thread safe
+        data.limit(data.capacity());
+        data.position(SIGNATURE_OFFSET + SIGNATURE_SIZE);
+        while (data.hasRemaining()) {
+            int count = Math.min(buffer.length, data.remaining());
+            data.get(buffer, 0, count);
+            digest.update(buffer, 0, count);
+        }
+        return digest.digest();
+    }
+
+    /**
+     * Returns the checksum of all but the first 12 bytes of {@code dex}.
+     */
+    public int computeChecksum() throws IOException {
+        Adler32 adler32 = new Adler32();
+        byte[] buffer = new byte[8192];
+        ByteBuffer data = this.data.duplicate(); // positioned ByteBuffers aren't thread safe
+        data.limit(data.capacity());
+        data.position(CHECKSUM_OFFSET + CHECKSUM_SIZE);
+        while (data.hasRemaining()) {
+            int count = Math.min(buffer.length, data.remaining());
+            data.get(buffer, 0, count);
+            adler32.update(buffer, 0, count);
+        }
+        return (int) adler32.getValue();
+    }
+
+    /**
+     * Generates the signature and checksum of the dex file {@code out} and
+     * writes them to the file.
+     */
+    public void writeHashes() throws IOException {
+        open(SIGNATURE_OFFSET).write(computeSignature());
+        open(CHECKSUM_OFFSET).writeInt(computeChecksum());
+    }
+
     public final class Section implements ByteInput, ByteOutput {
         private final String name;
-        private int position;
-        private final int limit;
+        private final ByteBuffer data;
         private final int initialPosition;
 
-        private Section(String name, int position, int limit) {
+        private Section(String name, ByteBuffer data) {
             this.name = name;
-            this.position = this.initialPosition = position;
-            this.limit = limit;
-        }
-
-        private Section(int position) {
-            this("section", position, data.length);
+            this.data = data;
+            this.initialPosition = data.position();
         }
 
         public int getPosition() {
-            return position;
+            return data.position();
         }
 
         public int readInt() {
-            int result = (data[position] & 0xff)
-                    | (data[position + 1] & 0xff) << 8
-                    | (data[position + 2] & 0xff) << 16
-                    | (data[position + 3] & 0xff) << 24;
-            position += 4;
-            return result;
+            return data.getInt();
         }
 
         public short readShort() {
-            int result = (data[position] & 0xff)
-                    | (data[position + 1] & 0xff) << 8;
-            position += 2;
-            return (short) result;
+            return data.getShort();
         }
 
         public int readUnsignedShort() {
@@ -343,12 +440,12 @@ public final class DexBuffer {
         }
 
         public byte readByte() {
-            return (byte) (data[position++] & 0xff);
+            return data.get();
         }
 
         public byte[] readByteArray(int length) {
-            byte[] result = Arrays.copyOfRange(data, position, position + length);
-            position += length;
+            byte[] result = new byte[length];
+            data.get(result);
             return result;
         }
 
@@ -361,15 +458,19 @@ public final class DexBuffer {
         }
 
         public int readUleb128() {
-            return Leb128Utils.readUnsignedLeb128(this);
+            return Leb128.readUnsignedLeb128(this);
         }
 
         public int readUleb128p1() {
-            return Leb128Utils.readUnsignedLeb128(this) - 1;
+            return Leb128.readUnsignedLeb128(this) - 1;
         }
 
         public int readSleb128() {
-            return Leb128Utils.readSignedLeb128(this);
+            return Leb128.readSignedLeb128(this);
+        }
+
+        public void writeUleb128p1(int i) {
+            writeUleb128(i + 1);
         }
 
         public TypeList readTypeList() {
@@ -379,13 +480,15 @@ public final class DexBuffer {
                 types[i] = readShort();
             }
             alignToFourBytes();
-            return new TypeList(DexBuffer.this, types);
+            return new TypeList(Dex.this, types);
         }
 
         public String readString() {
             int offset = readInt();
-            int savedPosition = position;
-            position = offset;
+            int savedPosition = data.position();
+            int savedLimit = data.limit();
+            data.position(offset);
+            data.limit(data.capacity());
             try {
                 int expectedLength = readUleb128();
                 String result = Mutf8.decode(this, new char[expectedLength]);
@@ -397,7 +500,8 @@ public final class DexBuffer {
             } catch (UTFDataFormatException e) {
                 throw new DexException(e);
             } finally {
-                position = savedPosition;
+                data.position(savedPosition);
+                data.limit(savedLimit);
             }
         }
 
@@ -405,21 +509,21 @@ public final class DexBuffer {
             int declaringClassIndex = readUnsignedShort();
             int typeIndex = readUnsignedShort();
             int nameIndex = readInt();
-            return new FieldId(DexBuffer.this, declaringClassIndex, typeIndex, nameIndex);
+            return new FieldId(Dex.this, declaringClassIndex, typeIndex, nameIndex);
         }
 
         public MethodId readMethodId() {
             int declaringClassIndex = readUnsignedShort();
             int protoIndex = readUnsignedShort();
             int nameIndex = readInt();
-            return new MethodId(DexBuffer.this, declaringClassIndex, protoIndex, nameIndex);
+            return new MethodId(Dex.this, declaringClassIndex, protoIndex, nameIndex);
         }
 
         public ProtoId readProtoId() {
             int shortyIndex = readInt();
             int returnTypeIndex = readInt();
             int parametersOffset = readInt();
-            return new ProtoId(DexBuffer.this, shortyIndex, returnTypeIndex, parametersOffset);
+            return new ProtoId(Dex.this, shortyIndex, returnTypeIndex, parametersOffset);
         }
 
         public ClassDef readClassDef() {
@@ -432,7 +536,7 @@ public final class DexBuffer {
             int annotationsOffset = readInt();
             int classDataOffset = readInt();
             int staticValuesOffset = readInt();
-            return new ClassDef(DexBuffer.this, offset, type, accessFlags, supertype,
+            return new ClassDef(Dex.this, offset, type, accessFlags, supertype,
                     interfacesOffset, sourceFileIndex, annotationsOffset, classDataOffset,
                     staticValuesOffset);
         }
@@ -448,71 +552,71 @@ public final class DexBuffer {
             Try[] tries;
             CatchHandler[] catchHandlers;
             if (triesSize > 0) {
-                if (instructions.length % 2 == 1) {
-                    readShort(); // padding
-                }
+              if (instructions.length % 2 == 1) {
+                  readShort(); // padding
+              }
 
-                /*
-                 * We can't read the tries until we've read the catch handlers.
-                 * Unfortunately they're in the opposite order in the dex file
-                 * so we need to read them out-of-order.
-                 */
-                Section triesSection = open(position);
-                skip(triesSize * SizeOf.TRY_ITEM);
-                catchHandlers = readCatchHandlers();
-                tries = triesSection.readTries(triesSize, catchHandlers);
-            } else {
-                tries = new Try[0];
-                catchHandlers = new CatchHandler[0];
-            }
-            return new Code(registersSize, insSize, outsSize, debugInfoOffset, instructions,
-                    tries, catchHandlers);
+              /*
+               * We can't read the tries until we've read the catch handlers.
+               * Unfortunately they're in the opposite order in the dex file
+               * so we need to read them out-of-order.
+               */
+              Section triesSection = open(data.position());
+              skip(triesSize * SizeOf.TRY_ITEM);
+              catchHandlers = readCatchHandlers();
+              tries = triesSection.readTries(triesSize, catchHandlers);
+          } else {
+              tries = new Try[0];
+              catchHandlers = new CatchHandler[0];
+          }
+          return new Code(registersSize, insSize, outsSize, debugInfoOffset, instructions,
+                  tries, catchHandlers);
         }
 
         private CatchHandler[] readCatchHandlers() {
-            int baseOffset = position;
-            int catchHandlersSize = readUleb128();
-            CatchHandler[] result = new CatchHandler[catchHandlersSize];
-            for (int i = 0; i < catchHandlersSize; i++) {
-                int offset = position - baseOffset;
-                result[i] = readCatchHandler(offset);
-            }
-            return result;
+          int baseOffset = data.position();
+          int catchHandlersSize = readUleb128();
+          CatchHandler[] result = new CatchHandler[catchHandlersSize];
+          for (int i = 0; i < catchHandlersSize; i++) {
+            int offset = data.position() - baseOffset;
+            result[i] = readCatchHandler(offset);
+          }
+          return result;
         }
 
         private Try[] readTries(int triesSize, CatchHandler[] catchHandlers) {
-            Try[] result = new Try[triesSize];
-            for (int i = 0; i < triesSize; i++) {
-                int startAddress = readInt();
-                int instructionCount = readUnsignedShort();
-                int handlerOffset = readUnsignedShort();
-                int catchHandlerIndex = findCatchHandlerIndex(catchHandlers, handlerOffset);
-                result[i] = new Try(startAddress, instructionCount, catchHandlerIndex);
-            }
-            return result;
+          Try[] result = new Try[triesSize];
+          for (int i = 0; i < triesSize; i++) {
+            int startAddress = readInt();
+            int instructionCount = readUnsignedShort();
+            int handlerOffset = readUnsignedShort();
+            int catchHandlerIndex = findCatchHandlerIndex(catchHandlers, handlerOffset);
+            result[i] = new Try(startAddress, instructionCount, catchHandlerIndex);
+          }
+          return result;
         }
 
         private int findCatchHandlerIndex(CatchHandler[] catchHandlers, int offset) {
-            for (int i = 0; i < catchHandlers.length; i++) {
-                CatchHandler catchHandler = catchHandlers[i];
-                if (catchHandler.getOffset() == offset) {
-                    return i;
-                }
+          for (int i = 0; i < catchHandlers.length; i++) {
+            CatchHandler catchHandler = catchHandlers[i];
+            if (catchHandler.getOffset() == offset) {
+              return i;
             }
-            throw new IllegalArgumentException();
+          }
+          throw new IllegalArgumentException();
         }
 
         private CatchHandler readCatchHandler(int offset) {
-            int size = readSleb128();
-            int handlersCount = Math.abs(size);
-            int[] typeIndexes = new int[handlersCount];
-            int[] addresses = new int[handlersCount];
-            for (int i = 0; i < handlersCount; i++) {
-                typeIndexes[i] = readUleb128();
-                addresses[i] = readUleb128();
-            }
-            int catchAllAddress = size <= 0 ? readUleb128() : -1;
-            return new CatchHandler(typeIndexes, addresses, catchAllAddress, offset);
+          int size = readSleb128();
+          int handlersCount = Math.abs(size);
+          int[] typeIndexes = new int[handlersCount];
+          int[] addresses = new int[handlersCount];
+          for (int i = 0; i < handlersCount; i++) {
+            typeIndexes[i] = readUleb128();
+            addresses[i] = readUleb128();
+          }
+          int catchAllAddress = size <= 0 ? readUleb128() : -1;
+          return new CatchHandler(typeIndexes, addresses, catchAllAddress, offset);
         }
 
         private ClassData readClassData() {
@@ -550,80 +654,70 @@ public final class DexBuffer {
             return result;
         }
 
-        public Annotation readAnnotation() {
-            byte visibility = readByte();
-            int typeIndex = readUleb128();
-            int size = readUleb128();
-            int[] names = new int[size];
-            EncodedValue[] values = new EncodedValue[size];
-            for (int i = 0; i < size; i++) {
-                names[i] = readUleb128();
-                values[i] = readEncodedValue();
-            }
-            return new Annotation(DexBuffer.this, visibility, typeIndex, names, values);
+        /**
+         * Returns a byte array containing the bytes from {@code start} to this
+         * section's current position.
+         */
+        private byte[] getBytesFrom(int start) {
+            int end = data.position();
+            byte[] result = new byte[end - start];
+            data.position(start);
+            data.get(result);
+            return result;
         }
 
-        public EncodedValue readEncodedValue() {
-            int start = position;
-            new EncodedValueReader(this).readValue();
-            int end = position;
-            return new EncodedValue(Arrays.copyOfRange(data, start, end));
+        public Annotation readAnnotation() {
+            byte visibility = readByte();
+            int start = data.position();
+            new EncodedValueReader(this, EncodedValueReader.ENCODED_ANNOTATION).skipValue();
+            return new Annotation(Dex.this, visibility, new EncodedValue(getBytesFrom(start)));
         }
 
         public EncodedValue readEncodedArray() {
-            int start = position;
-            new EncodedValueReader(this).readArray();
-            int end = position;
-            return new EncodedValue(Arrays.copyOfRange(data, start, end));
-        }
-
-        private void ensureCapacity(int size) {
-            if (position + size > limit) {
-                throw new DexException("Section limit " + limit + " exceeded by " + name);
-            }
+            int start = data.position();
+            new EncodedValueReader(this, EncodedValueReader.ENCODED_ARRAY).skipValue();
+            return new EncodedValue(getBytesFrom(start));
         }
 
         public void skip(int count) {
-            if (count < 0) {
-                throw new IllegalArgumentException();
-            }
-            ensureCapacity(count);
-            position += count;
+          if (count < 0) {
+              throw new IllegalArgumentException();
+          }
+          data.position(data.position() + count);
+      }
+
+        /**
+         * Skips bytes until the position is aligned to a multiple of 4.
+         */
+        public void alignToFourBytes() {
+            data.position((data.position() + 3) & ~3);
         }
 
         /**
          * Writes 0x00 until the position is aligned to a multiple of 4.
          */
-        public void alignToFourBytes() {
-            int unalignedCount = position;
-            position = DexBuffer.fourByteAlign(position);
-            for (int i = unalignedCount; i < position; i++) {
-                data[i] = 0;
+        public void alignToFourBytesWithZeroFill() {
+            while ((data.position() & 3) != 0) {
+                data.put((byte) 0);
             }
         }
 
         public void assertFourByteAligned() {
-            if ((position & 3) != 0) {
+            if ((data.position() & 3) != 0) {
                 throw new IllegalStateException("Not four byte aligned!");
             }
         }
 
         public void write(byte[] bytes) {
-            ensureCapacity(bytes.length);
-            System.arraycopy(bytes, 0, data, position, bytes.length);
-            position += bytes.length;
+            this.data.put(bytes);
         }
 
         public void writeByte(int b) {
-            ensureCapacity(1);
-            data[position++] = (byte) b;
+            data.put((byte) b);
         }
 
         public void writeShort(short i) {
-            ensureCapacity(2);
-            data[position    ] = (byte) i;
-            data[position + 1] = (byte) (i >>> 8);
-            position += 2;
+            data.putShort(i);
         }
 
         public void writeUnsignedShort(int i) {
@@ -641,33 +735,22 @@ public final class DexBuffer {
         }
 
         public void writeInt(int i) {
-            ensureCapacity(4);
-            data[position    ] = (byte) i;
-            data[position + 1] = (byte) (i >>>  8);
-            data[position + 2] = (byte) (i >>> 16);
-            data[position + 3] = (byte) (i >>> 24);
-            position += 4;
+            data.putInt(i);
         }
 
         public void writeUleb128(int i) {
             try {
-                Leb128Utils.writeUnsignedLeb128(this, i);
-                ensureCapacity(0);
+                Leb128.writeUnsignedLeb128(this, i);
             } catch (ArrayIndexOutOfBoundsException e) {
-                throw new DexException("Section limit " + limit + " exceeded by " + name);
+                throw new DexException("Section limit " + data.limit() + " exceeded by " + name);
             }
-        }
-
-        public void writeUleb128p1(int i) {
-            writeUleb128(i + 1);
         }
 
         public void writeSleb128(int i) {
             try {
-                Leb128Utils.writeSignedLeb128(this, i);
-                ensureCapacity(0);
+                Leb128.writeSignedLeb128(this, i);
             } catch (ArrayIndexOutOfBoundsException e) {
-                throw new DexException("Section limit " + limit + " exceeded by " + name);
+                throw new DexException("Section limit " + data.limit() + " exceeded by " + name);
             }
         }
 
@@ -688,21 +771,21 @@ public final class DexBuffer {
             for (short type : types) {
                 writeShort(type);
             }
-            alignToFourBytes();
+            alignToFourBytesWithZeroFill();
         }
 
         /**
          * Returns the number of bytes remaining in this section.
          */
         public int remaining() {
-            return limit - position;
+            return data.remaining();
         }
 
         /**
          * Returns the number of bytes used by this section.
          */
         public int used () {
-            return position - initialPosition;
+            return data.position() - initialPosition;
         }
     }
 }
